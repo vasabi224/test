@@ -1,0 +1,1098 @@
+if ! declare -f is_openrc >/dev/null 2>&1; then
+    _STEPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+    if [ -n "$_STEPS_DIR" ] && [ -f "${_STEPS_DIR}/../system/service.sh" ]; then
+        # shellcheck disable=SC1091
+        source "${_STEPS_DIR}/../system/service.sh"
+    elif [ -f "src/system/service.sh" ]; then
+        # shellcheck disable=SC1091
+        source "src/system/service.sh"
+    else
+        is_openrc() { return 1; }
+        is_systemd() { command -v systemctl >/dev/null 2>&1; }
+        svc_daemon_reload() { command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true; }
+        svc_start() { command -v systemctl >/dev/null 2>&1 && systemctl start "$1" 2>/dev/null || true; }
+        svc_stop() { command -v systemctl >/dev/null 2>&1 && systemctl stop "$1" 2>/dev/null || true; }
+        svc_restart() { command -v systemctl >/dev/null 2>&1 && systemctl restart "$1" 2>/dev/null || true; }
+        svc_reload() { command -v systemctl >/dev/null 2>&1 && systemctl reload "$1" 2>/dev/null || true; }
+        svc_enable() { command -v systemctl >/dev/null 2>&1 && systemctl enable "$1" 2>/dev/null || true; }
+        svc_disable() { command -v systemctl >/dev/null 2>&1 && systemctl disable "$1" 2>/dev/null || true; }
+        svc_is_active() { command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$1" 2>/dev/null; }
+    fi
+fi
+
+setup_zapret_service() {
+    log "Настройка службы Server-Side Zapret nfqws..."
+    local cur_arch
+    cur_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local z_arch="x86_64"
+    case "$cur_arch" in
+        x86_64|amd64) z_arch="x86_64" ;;
+        aarch64|arm64) z_arch="aarch64" ;;
+        *) z_arch="x86_64" ;;
+    esac
+
+    local bin_dir="${LOCAL_BIN_DIR:-/usr/local/bin}"
+    [ -d "$bin_dir" ] || mkdir -p "$bin_dir" 2>/dev/null || true
+
+    if [ ! -x "${bin_dir}/nfqws" ]; then
+        local z_tmp="/tmp/zapret_staging_$$"
+        mkdir -p "$z_tmp"
+        if download_manifest_component "zapret" "$z_tmp/zapret.tar.gz" "all"; then
+            tar -zxf "$z_tmp/zapret.tar.gz" -C "$z_tmp" --strip-components=1 2>/dev/null || true
+            if [ -f "$z_tmp/binaries/linux-${z_arch}/nfqws" ]; then
+                cp "$z_tmp/binaries/linux-${z_arch}/nfqws" "${bin_dir}/nfqws"
+                chmod +x "${bin_dir}/nfqws"
+            elif [ -f "$z_tmp/binaries/${z_arch}/nfqws" ]; then
+                cp "$z_tmp/binaries/${z_arch}/nfqws" "${bin_dir}/nfqws"
+                chmod +x "${bin_dir}/nfqws"
+            elif [ -n "$(find "$z_tmp" -path "*/linux-${z_arch}/*" -name nfqws -type f 2>/dev/null)" ]; then
+                cp "$(find "$z_tmp" -path "*/linux-${z_arch}/*" -name nfqws -type f | head -n1)" "${bin_dir}/nfqws"
+                chmod +x "${bin_dir}/nfqws"
+            elif [ -n "$(find "$z_tmp" -name nfqws -type f 2>/dev/null)" ]; then
+                local found_bin
+                found_bin="$(find "$z_tmp" -name nfqws -type f | grep -v "android" | head -n1 || find "$z_tmp" -name nfqws -type f | head -n1)"
+                cp "$found_bin" "${bin_dir}/nfqws"
+                chmod +x "${bin_dir}/nfqws"
+            elif [ -d "$z_tmp/nfqws" ]; then
+                make -C "$z_tmp/nfqws" >/dev/null 2>&1 || true
+                if [ -f "$z_tmp/nfqws/nfqws" ]; then
+                    cp "$z_tmp/nfqws/nfqws" "${bin_dir}/nfqws"
+                    chmod +x "${bin_dir}/nfqws"
+                fi
+            fi
+        fi
+        rm -rf "$z_tmp" 2>/dev/null || true
+    fi
+
+    local qnum="${ZAPRET_QNUM:-200}"
+    local desync="${ZAPRET_DESYNC:-split2}"
+    local fooling="${ZAPRET_FOOLING:-md5sig,badseq}"
+    local iptables_bin
+    iptables_bin="$(command -v iptables 2>/dev/null || echo "/usr/sbin/iptables")"
+
+    local pre_cmd="${iptables_bin} -t mangle -D POSTROUTING -p tcp -m connbytes --connbytes 1:6 --connbytes-mode packets --connbytes-dir original -m mark ! --mark 0x40000000/0x40000000 -j NFQUEUE --queue-num ${qnum} --queue-bypass 2>/dev/null || true; ${iptables_bin} -t mangle -I POSTROUTING -p tcp -m connbytes --connbytes 1:6 --connbytes-mode packets --connbytes-dir original -m mark ! --mark 0x40000000/0x40000000 -j NFQUEUE --queue-num ${qnum} --queue-bypass 2>/dev/null || true"
+    local post_cmd="${iptables_bin} -t mangle -D POSTROUTING -p tcp -m connbytes --connbytes 1:6 --connbytes-mode packets --connbytes-dir original -m mark ! --mark 0x40000000/0x40000000 -j NFQUEUE --queue-num ${qnum} --queue-bypass 2>/dev/null || true"
+
+    if is_openrc; then
+        mkdir -p /etc/init.d /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        cat << EOF > /etc/init.d/zapret-server
+#!/sbin/openrc-run
+description="Server-Side Zapret nfqws DPI Desync Daemon"
+supervisor="supervise-daemon"
+command="${bin_dir}/nfqws"
+command_args="--qnum=${qnum} --dpi-desync=${desync} --dpi-desync-fooling=${fooling}"
+pidfile="/run/\${RC_SVCNAME}.pid"
+respawn_delay=3
+respawn_max=5
+
+start_pre() {
+    ${pre_cmd}
+}
+
+stop_post() {
+    ${post_cmd}
+}
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/zapret-server
+    else
+        mkdir -p /etc/systemd/system
+        cat << EOF > /etc/systemd/system/zapret-server.service
+[Unit]
+Description=Server-Side Zapret nfqws DPI Desync Daemon
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=+/bin/sh -c '${pre_cmd}'
+ExecStart=${bin_dir}/nfqws --qnum=${qnum} --dpi-desync=${desync} --dpi-desync-fooling=${fooling}
+ExecStopPost=+/bin/sh -c '${post_cmd}'
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    svc_enable zapret-server
+    if [ -x "${bin_dir}/nfqws" ]; then
+        svc_restart zapret-server 2>/dev/null || true
+        ok "Служба Server-Side Zapret активирована (NFQUEUE $qnum, desync: $desync)."
+    else
+        warn "Бинарник ${bin_dir}/nfqws не найден, запуск zapret-server отложен."
+    fi
+}
+
+setup_masque_service() {
+    log "Настройка службы Sing-box MASQUE (RFC 9484 / RFC 9298)..."
+    local cur_arch
+    cur_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local sb_arch="amd64"
+    case "$cur_arch" in
+        x86_64|amd64) sb_arch="amd64" ;;
+        aarch64|arm64) sb_arch="arm64" ;;
+        *) sb_arch="amd64" ;;
+    esac
+
+    local bin_dir="${LOCAL_BIN_DIR:-/usr/local/bin}"
+    [ -d "$bin_dir" ] || mkdir -p "$bin_dir" 2>/dev/null || true
+
+    local sb_ver="1.15.0-alpha.13"
+    if [ -x "${bin_dir}/sing-box" ]; then
+        local cur_sb_ver="$("${bin_dir}/sing-box" version 2>/dev/null | head -n1 || echo "")"
+        if [[ "$cur_sb_ver" == *"1.11"* ]] || [[ "$cur_sb_ver" == *"1.12"* ]] || [[ "$cur_sb_ver" == *"1.13"* ]] || [[ "$cur_sb_ver" == *"1.14"* ]]; then
+            rm -f "${bin_dir}/sing-box"
+        fi
+    fi
+
+    if [ ! -x "${bin_dir}/sing-box" ]; then
+        local sb_tmp="/tmp/sing-box_${sb_ver}"
+        mkdir -p "$sb_tmp"
+        local sb_urls=()
+        if is_openrc || [ "${ID:-}" = "alpine" ]; then
+            sb_urls+=(
+                "https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${sb_arch}-musl.tar.gz"
+                "https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${sb_arch}-musl.tar.gz"
+            )
+        fi
+        sb_urls+=(
+            "https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${sb_arch}.tar.gz"
+            "https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${sb_arch}.tar.gz"
+        )
+        for u in "${sb_urls[@]}"; do
+            if curl -fsSL --connect-timeout 15 "$u" -o "$sb_tmp/sb.tar.gz" 2>/dev/null; then
+                tar -zxf "$sb_tmp/sb.tar.gz" -C "$sb_tmp" --strip-components=1 2>/dev/null || true
+                if [ -f "$sb_tmp/sing-box" ]; then
+                    cp "$sb_tmp/sing-box" "${bin_dir}/sing-box"
+                    chmod +x "${bin_dir}/sing-box"
+                    break
+                elif [ -n "$(find "$sb_tmp" -name sing-box -type f 2>/dev/null)" ]; then
+                    cp "$(find "$sb_tmp" -name sing-box -type f | head -n1)" "${bin_dir}/sing-box"
+                    chmod +x "${bin_dir}/sing-box"
+                    break
+                fi
+            fi
+        done
+        rm -rf "$sb_tmp" 2>/dev/null || true
+    fi
+
+    local masque_p="${MASQUE_PORT:-8449}"
+    local masque_u="${MASQUE_USER:-client}"
+    local masque_pw="${MASQUE_PASSWORD:-}"
+    local cert_file="${SSL_BASE_DIR:-/etc/letsencrypt/live}/${PRIMARY_DOMAIN}/fullchain.pem"
+    local key_file="${SSL_BASE_DIR:-/etc/letsencrypt/live}/${PRIMARY_DOMAIN}/privkey.pem"
+    if [ ! -f "$cert_file" ] && [ -f "/etc/ssl/acme/${PRIMARY_DOMAIN}/fullchain.pem" ]; then
+        cert_file="/etc/ssl/acme/${PRIMARY_DOMAIN}/fullchain.pem"
+        key_file="/etc/ssl/acme/${PRIMARY_DOMAIN}/privkey.pem"
+    elif [ ! -f "$cert_file" ] && [ -f "/etc/letsencrypt/live/${PRIMARY_DOMAIN}/fullchain.pem" ]; then
+        cert_file="/etc/letsencrypt/live/${PRIMARY_DOMAIN}/fullchain.pem"
+        key_file="/etc/letsencrypt/live/${PRIMARY_DOMAIN}/privkey.pem"
+    fi
+
+    mkdir -p /etc/sing-box
+    if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then
+        mkdir -p /etc/sing-box/ssl
+        if [ ! -f /etc/sing-box/ssl/fullchain.pem ]; then
+            openssl req -x509 -newkey rsa:2048 -nodes \
+                -keyout /etc/sing-box/ssl/privkey.pem \
+                -out /etc/sing-box/ssl/fullchain.pem \
+                -days 365 -subj "/CN=${PRIMARY_DOMAIN:-localhost}" 2>/dev/null || true
+        fi
+        cert_file="/etc/sing-box/ssl/fullchain.pem"
+        key_file="/etc/sing-box/ssl/privkey.pem"
+    fi
+
+    cat << EOF > /etc/sing-box/masque.json
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "endpoints": [
+    {
+      "type": "masque-server",
+      "tag": "masque-in",
+      "listen": "::",
+      "listen_port": ${masque_p},
+      "users": [
+        {
+          "username": "${masque_u}",
+          "password": "${masque_pw}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${PRIMARY_DOMAIN}",
+        "certificate_path": "${cert_file}",
+        "key_path": "${key_file}",
+        "alpn": ["h3"]
+      },
+      "address": ["10.138.0.1/24"]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+    if is_openrc; then
+        mkdir -p /etc/init.d /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        cat << EOF > /etc/init.d/sing-box-masque
+#!/sbin/openrc-run
+description="Sing-box MASQUE (RFC 9484 / RFC 9298) Daemon"
+supervisor="supervise-daemon"
+command="${bin_dir}/sing-box"
+command_args="run -c /etc/sing-box/masque.json"
+pidfile="/run/\${RC_SVCNAME}.pid"
+respawn_delay=3
+respawn_max=5
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/sing-box-masque
+    else
+        mkdir -p /etc/systemd/system
+        cat << EOF > /etc/systemd/system/sing-box-masque.service
+[Unit]
+Description=Sing-box MASQUE (RFC 9484 / RFC 9298) Daemon
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=${bin_dir}/sing-box run -c /etc/sing-box/masque.json
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    svc_enable sing-box-masque
+    if [ -x "${bin_dir}/sing-box" ]; then
+        svc_restart sing-box-masque 2>/dev/null || true
+        sleep 1
+        if svc_is_active sing-box-masque; then
+            ok "Служба Sing-box MASQUE активирована (порт ${masque_p}/udp, H3/QUIC)."
+        else
+            warn "Служба sing-box-masque не перешла в статус active. Проверьте: journalctl -u sing-box-masque -n 20"
+            if command -v journalctl >/dev/null 2>&1; then
+                journalctl -u sing-box-masque -n 15 --no-pager 2>/dev/null || true
+            elif command -v rc-service >/dev/null 2>&1; then
+                rc-service sing-box-masque status 2>/dev/null || true
+            fi
+        fi
+    else
+        warn "Бинарник ${bin_dir}/sing-box не найден, запуск sing-box-masque отложен."
+    fi
+}
+
+setup_shadowtls_service() {
+    log "Настройка службы ShadowTLS v4..."
+    local cur_arch
+    cur_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local st_arch="x86_64"
+    case "$cur_arch" in
+        x86_64|amd64) st_arch="x86_64" ;;
+        aarch64|arm64) st_arch="aarch64" ;;
+        *) st_arch="x86_64" ;;
+    esac
+
+    local bin_dir="${LOCAL_BIN_DIR:-/usr/local/bin}"
+    [ -d "$bin_dir" ] || mkdir -p "$bin_dir" 2>/dev/null || true
+
+    if [ ! -x "${bin_dir}/shadow-tls" ]; then
+        if download_manifest_component "shadow-tls" "${bin_dir}/shadow-tls" "$st_arch"; then
+            chmod +x "${bin_dir}/shadow-tls"
+        fi
+    fi
+
+    local st_port="${SHADOWTLS_PORT:-8543}"
+    local ss_backend_port="${SS2022_PORT:-8388}"
+    local st_sni="${SHADOWTLS_SNI:-gateway.icloud.com}"
+    local st_pwd="${SHADOWTLS_PASSWORD:-}"
+
+    if is_openrc; then
+        mkdir -p /etc/init.d /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        cat << EOF > /etc/init.d/shadow-tls
+#!/sbin/openrc-run
+description="ShadowTLS v4 Stealth SNI Decoy Gateway"
+supervisor="supervise-daemon"
+command="${bin_dir}/shadow-tls"
+command_args="--v3 server --listen 127.0.0.1:${st_port} --server 127.0.0.1:${ss_backend_port} --tls ${st_sni}:443 --password ${st_pwd}"
+pidfile="/run/\${RC_SVCNAME}.pid"
+respawn_delay=3
+respawn_max=5
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/shadow-tls
+    else
+        mkdir -p /etc/systemd/system
+        cat << EOF > /etc/systemd/system/shadow-tls.service
+[Unit]
+Description=ShadowTLS v4 Stealth SNI Decoy Gateway
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=${bin_dir}/shadow-tls --v3 server --listen 127.0.0.1:${st_port} --server 127.0.0.1:${ss_backend_port} --tls ${st_sni}:443 --password ${st_pwd}
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    svc_enable shadow-tls
+    if [ -x "${bin_dir}/shadow-tls" ]; then
+        svc_restart shadow-tls 2>/dev/null || true
+        ok "Служба ShadowTLS v4 активирована (порт ${st_port}, decoy: ${st_sni})."
+    else
+        warn "Бинарник ${bin_dir}/shadow-tls не найден, запуск shadow-tls отложен."
+    fi
+}
+
+setup_wstunnel_service() {
+    log "Настройка службы Wstunnel L7..."
+    local cur_arch
+    cur_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local ws_arch="x86_64"
+    case "$cur_arch" in
+        x86_64|amd64) ws_arch="x86_64" ;;
+        aarch64|arm64) ws_arch="aarch64" ;;
+        *) ws_arch="x86_64" ;;
+    esac
+
+    local bin_dir="${LOCAL_BIN_DIR:-/usr/local/bin}"
+    [ -d "$bin_dir" ] || mkdir -p "$bin_dir" 2>/dev/null || true
+
+    if [ ! -x "${bin_dir}/wstunnel" ]; then
+        local ws_tmp="/tmp/wstunnel_staging_$$"
+        mkdir -p "$ws_tmp"
+        if download_manifest_component "wstunnel" "$ws_tmp/wstunnel.tar.gz" "$ws_arch"; then
+            tar -zxf "$ws_tmp/wstunnel.tar.gz" -C "$ws_tmp" 2>/dev/null || true
+            if [ -f "$ws_tmp/wstunnel" ]; then
+                cp "$ws_tmp/wstunnel" "${bin_dir}/wstunnel"
+                chmod +x "${bin_dir}/wstunnel"
+            elif [ -n "$(find "$ws_tmp" -name wstunnel -type f 2>/dev/null)" ]; then
+                cp "$(find "$ws_tmp" -name wstunnel -type f | head -n1)" "${bin_dir}/wstunnel"
+                chmod +x "${bin_dir}/wstunnel"
+            fi
+        fi
+        rm -rf "$ws_tmp" 2>/dev/null || true
+    fi
+
+    local ws_port="${WSTUNNEL_PORT:-8080}"
+    local ws_prefix="${WSTUNNEL_PREFIX#/}"
+    ws_prefix="${ws_prefix%/}"
+
+    if is_openrc; then
+        mkdir -p /etc/init.d /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        cat << EOF > /etc/init.d/wstunnel
+#!/sbin/openrc-run
+description="Wstunnel L7 WebSocket Tunnel Daemon"
+supervisor="supervise-daemon"
+command="${bin_dir}/wstunnel"
+command_args="server --restrict-http-upgrade-path-prefix ${ws_prefix} ws://127.0.0.1:${ws_port}"
+pidfile="/run/\${RC_SVCNAME}.pid"
+respawn_delay=3
+respawn_max=5
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/wstunnel
+    else
+        mkdir -p /etc/systemd/system
+        cat << EOF > /etc/systemd/system/wstunnel.service
+[Unit]
+Description=Wstunnel L7 WebSocket Tunnel Daemon
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=${bin_dir}/wstunnel server --restrict-http-upgrade-path-prefix ${ws_prefix} ws://127.0.0.1:${ws_port}
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    svc_enable wstunnel
+    if [ -x "${bin_dir}/wstunnel" ]; then
+        svc_restart wstunnel 2>/dev/null || true
+        ok "Служба Wstunnel L7 активирована (порт ${ws_port}, prefix: /${ws_prefix}/)."
+    else
+        warn "Бинарник ${bin_dir}/wstunnel не найден, запуск wstunnel отложен."
+    fi
+}
+
+setup_naive_service() {
+    log "Настройка службы NaïveProxy (Caddy forwardproxy@naive)..."
+    local cur_arch
+    cur_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local caddy_arch="amd64"
+    case "$cur_arch" in
+        x86_64|amd64) caddy_arch="amd64" ;;
+        aarch64|arm64) caddy_arch="arm64" ;;
+        *) caddy_arch="amd64" ;;
+    esac
+
+    local bin_dir="${LOCAL_BIN_DIR:-/usr/local/bin}"
+    [ -d "$bin_dir" ] || mkdir -p "$bin_dir" 2>/dev/null || true
+
+    local caddy_bin="${bin_dir}/caddy-naive"
+    if [ -x "$caddy_bin" ] && ! "$caddy_bin" list-modules 2>/dev/null | grep -q 'forward_proxy'; then
+        rm -f "$caddy_bin"
+    fi
+    if [ ! -x "$caddy_bin" ] && command -v caddy-naive >/dev/null 2>&1; then
+        local cand="$(command -v caddy-naive)"
+        if "$cand" list-modules 2>/dev/null | grep -q 'forward_proxy'; then
+            caddy_bin="$cand"
+        fi
+    fi
+    if [ ! -x "$caddy_bin" ] && [ -x "${bin_dir}/caddy" ]; then
+        if "${bin_dir}/caddy" list-modules 2>/dev/null | grep -q 'forward_proxy'; then
+            caddy_bin="${bin_dir}/caddy"
+        fi
+    fi
+    if [ ! -x "$caddy_bin" ] && command -v caddy >/dev/null 2>&1; then
+        local cand="$(command -v caddy)"
+        if "$cand" list-modules 2>/dev/null | grep -q 'forward_proxy'; then
+            caddy_bin="$cand"
+        fi
+    fi
+
+    if [ ! -x "$caddy_bin" ]; then
+        local caddy_tmp="/tmp/caddy_naive_$$"
+        mkdir -p "$caddy_tmp"
+        local rel_ver="${SCRIPT_VERSION:-v9.1.0}"
+        [[ "$rel_ver" == "__VERSION__" ]] && rel_ver="v9.1.0"
+        [[ "$rel_ver" != v* ]] && rel_ver="v${rel_ver}"
+        local dl_url="https://github.com/torrua/Nginx-L4-Stream-Router-Mask-for-3x-ui/releases/download/${rel_ver}/caddy-naive-linux-${caddy_arch}.tar.gz"
+        local dl_mirror="https://ghfast.top/${dl_url}"
+        local dl_fallback="https://github.com/torrua/Nginx-L4-Stream-Router-Mask-for-3x-ui/releases/download/v9.1.0/caddy-naive-linux-${caddy_arch}.tar.gz"
+        if curl -fsSL --connect-timeout 15 "$dl_url" -o "$caddy_tmp/caddy.tar.gz" 2>/dev/null || \
+           curl -fsSL --connect-timeout 15 "$dl_mirror" -o "$caddy_tmp/caddy.tar.gz" 2>/dev/null || \
+           curl -fsSL --connect-timeout 15 "$dl_fallback" -o "$caddy_tmp/caddy.tar.gz" 2>/dev/null; then
+            tar -zxf "$caddy_tmp/caddy.tar.gz" -C "$caddy_tmp" 2>/dev/null || true
+            if [ -f "$caddy_tmp/caddy-naive" ]; then
+                cp "$caddy_tmp/caddy-naive" "${bin_dir}/caddy-naive"
+                chmod +x "${bin_dir}/caddy-naive"
+                caddy_bin="${bin_dir}/caddy-naive"
+            elif [ -f "$caddy_tmp/caddy" ]; then
+                cp "$caddy_tmp/caddy" "${bin_dir}/caddy-naive"
+                chmod +x "${bin_dir}/caddy-naive"
+                caddy_bin="${bin_dir}/caddy-naive"
+            fi
+        fi
+        rm -rf "$caddy_tmp" 2>/dev/null || true
+    fi
+
+    local naive_port="${NAIVE_PORT:-8446}"
+    local naive_user="${NAIVE_USER:-user}"
+    local naive_pass="${NAIVE_PASS:-}"
+    if [ -z "$naive_pass" ]; then
+        naive_pass="$(generate_urlsafe_token 16)"
+        NAIVE_PASS="$naive_pass"
+    fi
+    export NAIVE_PASS="$naive_pass"
+
+    local naive_domain="${NAIVE_DOMAIN:-naive.${PRIMARY_DOMAIN:-}}"
+    if [ -z "$naive_domain" ] || [ "$naive_domain" = "${PRIMARY_DOMAIN:-}" ]; then
+        if [ -n "${PRIMARY_DOMAIN:-}" ]; then
+            naive_domain="naive.${PRIMARY_DOMAIN}"
+        else
+            naive_domain="localhost"
+        fi
+    fi
+    NAIVE_DOMAIN="$naive_domain"
+    export NAIVE_DOMAIN="$naive_domain"
+
+    mkdir -p /etc/caddy /etc/naiveproxy /var/www/html 2>/dev/null || true
+    if [ ! -f /var/www/html/index.html ]; then
+        echo "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>Welcome to Nginx Stream Mask</h1></body></html>" > /var/www/html/index.html 2>/dev/null || true
+    fi
+
+    local tls_directive="tls internal"
+    local cert_candidates=()
+    [ -n "$naive_domain" ] && [ "$naive_domain" != "localhost" ] && cert_candidates+=("$naive_domain")
+    [ -n "${PRIMARY_DOMAIN:-}" ] && cert_candidates+=("${PRIMARY_DOMAIN}")
+    [ -n "${DOMAIN:-}" ] && cert_candidates+=("${DOMAIN}")
+
+    for c_dom in "${cert_candidates[@]}"; do
+        if [ -f "/etc/letsencrypt/live/${c_dom}/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/${c_dom}/privkey.pem" ]; then
+            tls_directive="tls /etc/letsencrypt/live/${c_dom}/fullchain.pem /etc/letsencrypt/live/${c_dom}/privkey.pem"
+            break
+        elif [ -f "/etc/ssl/acme/${c_dom}/fullchain.pem" ] && [ -f "/etc/ssl/acme/${c_dom}/privkey.pem" ]; then
+            tls_directive="tls /etc/ssl/acme/${c_dom}/fullchain.pem /etc/ssl/acme/${c_dom}/privkey.pem"
+            break
+        fi
+    done
+
+    cat << EOF > /etc/caddy/Caddyfile
+{
+  order forward_proxy before reverse_proxy
+  admin off
+  auto_https disable_redirects
+}
+
+:${naive_port} {
+  bind 127.0.0.1
+  ${tls_directive}
+
+  forward_proxy {
+    basic_auth ${naive_user} ${naive_pass}
+    hide_ip
+    hide_via
+    probe_resistance
+  }
+
+  file_server {
+    root /var/www/html
+  }
+}
+EOF
+    cp -f /etc/caddy/Caddyfile /etc/naiveproxy/Caddyfile 2>/dev/null || true
+
+    if is_openrc; then
+        mkdir -p /etc/init.d /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        cat << EOF > /etc/init.d/caddy-naive
+#!/sbin/openrc-run
+description="Caddy NaïveProxy Server Daemon"
+supervisor="supervise-daemon"
+command="${caddy_bin}"
+command_args="run --config /etc/caddy/Caddyfile --adapter caddyfile"
+pidfile="/run/\${RC_SVCNAME}.pid"
+respawn_delay=3
+respawn_max=5
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/caddy-naive
+    else
+        mkdir -p /etc/systemd/system
+        cat << EOF > /etc/systemd/system/caddy-naive.service
+[Unit]
+Description=Caddy NaïveProxy Server Daemon
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=${caddy_bin} run --config /etc/caddy/Caddyfile --adapter caddyfile
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    svc_enable caddy-naive
+    if [ -x "$caddy_bin" ]; then
+        svc_restart caddy-naive 2>/dev/null || true
+        sleep 1
+        if svc_is_active caddy-naive; then
+            ok "Служба NaïveProxy активирована (порт ${naive_port}, user: ${naive_user})."
+        else
+            warn "Служба caddy-naive не перешла в статус active. Проверьте: journalctl -u caddy-naive -n 20"
+            if command -v journalctl >/dev/null 2>&1; then
+                journalctl -u caddy-naive -n 15 --no-pager 2>/dev/null || true
+            elif command -v rc-service >/dev/null 2>&1; then
+                rc-service caddy-naive status 2>/dev/null || true
+            fi
+        fi
+    else
+        warn "Бинарник ${caddy_bin} не найден, запуск caddy-naive отложен."
+    fi
+}
+
+setup_dnstt_service() {
+    log "Настройка службы DNSTT (DoH DNS Tunneling)..."
+    local cur_arch
+    cur_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local dnstt_arch="amd64"
+    case "$cur_arch" in
+        x86_64|amd64) dnstt_arch="amd64" ;;
+        aarch64|arm64) dnstt_arch="arm64" ;;
+        *) dnstt_arch="amd64" ;;
+    esac
+
+    local bin_dir="${LOCAL_BIN_DIR:-/usr/local/bin}"
+    [ -d "$bin_dir" ] || mkdir -p "$bin_dir" 2>/dev/null || true
+
+    local dnstt_bin="${bin_dir}/dnstt-server"
+    if [ ! -x "$dnstt_bin" ] && command -v dnstt-server >/dev/null 2>&1; then
+        dnstt_bin="$(command -v dnstt-server)"
+    fi
+
+    if [ ! -x "$dnstt_bin" ]; then
+        local dnstt_tmp="/tmp/dnstt_$$"
+        mkdir -p "$dnstt_tmp"
+        local rel_ver="${SCRIPT_VERSION:-v9.1.0}"
+        [[ "$rel_ver" == "__VERSION__" ]] && rel_ver="v9.1.0"
+        [[ "$rel_ver" != v* ]] && rel_ver="v${rel_ver}"
+        local dl_url="https://github.com/torrua/Nginx-L4-Stream-Router-Mask-for-3x-ui/releases/download/${rel_ver}/dnstt-server-linux-${dnstt_arch}.tar.gz"
+        local dl_mirror="https://ghfast.top/${dl_url}"
+        local dl_fallback="https://github.com/torrua/Nginx-L4-Stream-Router-Mask-for-3x-ui/releases/download/v9.1.0/dnstt-server-linux-${dnstt_arch}.tar.gz"
+        if curl -fsSL --connect-timeout 15 "$dl_url" -o "$dnstt_tmp/dnstt.tar.gz" 2>/dev/null || \
+           curl -fsSL --connect-timeout 15 "$dl_mirror" -o "$dnstt_tmp/dnstt.tar.gz" 2>/dev/null || \
+           curl -fsSL --connect-timeout 15 "$dl_fallback" -o "$dnstt_tmp/dnstt.tar.gz" 2>/dev/null; then
+            tar -zxf "$dnstt_tmp/dnstt.tar.gz" -C "$dnstt_tmp" 2>/dev/null || true
+            if [ -f "$dnstt_tmp/dnstt-server" ]; then
+                cp "$dnstt_tmp/dnstt-server" "${bin_dir}/dnstt-server"
+                chmod +x "${bin_dir}/dnstt-server"
+                dnstt_bin="${bin_dir}/dnstt-server"
+            fi
+        fi
+        rm -rf "$dnstt_tmp" 2>/dev/null || true
+    fi
+
+    if [ ! -x "$dnstt_bin" ] && command -v go >/dev/null 2>&1; then
+        log "Компиляция dnstt-server из исходников (Go)..."
+        if CGO_ENABLED=0 go install -ldflags='-s -w' www.bamsoftware.com/git/dnstt.git/dnstt-server@latest >/dev/null 2>&1; then
+            local gopath="$(go env GOPATH 2>/dev/null || echo "$HOME/go")"
+            if [ -f "${gopath}/bin/dnstt-server" ]; then
+                cp "${gopath}/bin/dnstt-server" "${bin_dir}/dnstt-server"
+                chmod +x "${bin_dir}/dnstt-server"
+                dnstt_bin="${bin_dir}/dnstt-server"
+            fi
+        fi
+    fi
+
+    local dnstt_port="${DNSTT_PORT:-53053}"
+    local ss_backend_port="${SS2022_PORT:-8388}"
+    local dnstt_domain="${DNSTT_DOMAIN:-t.${PRIMARY_DOMAIN:-example.com}}"
+
+    mkdir -p /etc/dnstt
+    chmod 700 /etc/dnstt 2>/dev/null || true
+
+    if [ ! -f /etc/dnstt/server.key ] || [ ! -f /etc/dnstt/server.pub ]; then
+        if [ -x "$dnstt_bin" ]; then
+            "$dnstt_bin" -gen-key -privkey-file /etc/dnstt/server.key -pubkey-file /etc/dnstt/server.pub >/dev/null 2>&1 || true
+        fi
+        if [ ! -f /etc/dnstt/server.key ] || [ ! -f /etc/dnstt/server.pub ]; then
+            python3 - /etc/dnstt/server.key /etc/dnstt/server.pub << 'EOF_DNSTT_KEY' >/dev/null 2>&1 || true
+try:
+    from src.common.crypto_engine import generate_dnstt_keypair
+except ImportError:
+    try:
+        from common.crypto_engine import generate_dnstt_keypair
+    except ImportError:
+        pass
+# @include "common/crypto_engine.py"
+import sys
+key_file, pub_file = sys.argv[1], sys.argv[2]
+priv_hex, pub_hex = generate_dnstt_keypair()
+with open(key_file, 'w') as kf:
+    kf.write(priv_hex + '\n')
+with open(pub_file, 'w') as pf:
+    pf.write(pub_hex + '\n')
+EOF_DNSTT_KEY
+            if [ ! -f /etc/dnstt/server.key ] || [ ! -f /etc/dnstt/server.pub ]; then
+                head /dev/urandom 2>/dev/null | tr -dc 0-9a-f | head -c 64 > /etc/dnstt/server.key 2>/dev/null || echo "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" > /etc/dnstt/server.key
+                head /dev/urandom 2>/dev/null | tr -dc 0-9a-f | head -c 64 > /etc/dnstt/server.pub 2>/dev/null || echo "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" > /etc/dnstt/server.pub
+            fi
+        fi
+        chmod 600 /etc/dnstt/server.key /etc/dnstt/server.pub 2>/dev/null || true
+    fi
+
+    DNSTT_PUBKEY="$(cat /etc/dnstt/server.pub 2>/dev/null | tr -d '[:space:]')"
+    export DNSTT_PUBKEY
+
+    if is_openrc; then
+        mkdir -p /etc/init.d /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        cat << EOF > /etc/init.d/dnstt-server
+#!/sbin/openrc-run
+description="DNSTT DNS Tunneling Server Daemon (DoH / UDP)"
+supervisor="supervise-daemon"
+command="${dnstt_bin}"
+command_args="-udp 0.0.0.0:${dnstt_port} -privkey-file /etc/dnstt/server.key ${dnstt_domain} 127.0.0.1:${ss_backend_port}"
+pidfile="/run/\${RC_SVCNAME}.pid"
+respawn_delay=3
+respawn_max=5
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/dnstt-server
+    else
+        mkdir -p /etc/systemd/system
+        cat << EOF > /etc/systemd/system/dnstt-server.service
+[Unit]
+Description=DNSTT DNS Tunneling Server Daemon (DoH / UDP)
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=${dnstt_bin} -udp 0.0.0.0:${dnstt_port} -privkey-file /etc/dnstt/server.key ${dnstt_domain} 127.0.0.1:${ss_backend_port}
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    svc_enable dnstt-server
+    if [ -x "$dnstt_bin" ]; then
+        svc_restart dnstt-server 2>/dev/null || true
+        sleep 1
+        if svc_is_active dnstt-server; then
+            ok "Служба DNSTT активирована (порт ${dnstt_port}/udp, домен: ${dnstt_domain})."
+        else
+            warn "Служба dnstt-server не перешла в статус active. Проверьте: journalctl -u dnstt-server -n 20"
+            if command -v journalctl >/dev/null 2>&1; then
+                journalctl -u dnstt-server -n 15 --no-pager 2>/dev/null || true
+            elif command -v rc-service >/dev/null 2>&1; then
+                rc-service dnstt-server status 2>/dev/null || true
+            fi
+        fi
+    else
+        warn "Бинарник ${dnstt_bin} не найден, запуск dnstt-server отложен."
+    fi
+}
+
+setup_mieru_service() {
+    log "Настройка службы Mieru Proxy (mita)..."
+    local cur_arch
+    cur_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local mita_arch="amd64"
+    case "$cur_arch" in
+        x86_64|amd64) mita_arch="amd64" ;;
+        aarch64|arm64) mita_arch="arm64" ;;
+        *) mita_arch="amd64" ;;
+    esac
+
+    local bin_dir="${LOCAL_BIN_DIR:-/usr/local/bin}"
+    [ -d "$bin_dir" ] || mkdir -p "$bin_dir" 2>/dev/null || true
+
+    local mita_bin="${bin_dir}/mita"
+    if [ ! -x "$mita_bin" ] && command -v mita >/dev/null 2>&1; then
+        mita_bin="$(command -v mita)"
+    fi
+
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-ntp true 2>/dev/null || true
+        systemctl restart systemd-timesyncd 2>/dev/null || true
+    fi
+
+    if [ ! -x "$mita_bin" ]; then
+        local mita_ver="3.39.0"
+        local mita_tmp="/tmp/mita_${mita_ver}_$$"
+        mkdir -p "$mita_tmp"
+        local dl_url="https://github.com/enfein/mieru/releases/download/v${mita_ver}/mita_${mita_ver}_linux_${mita_arch}.tar.gz"
+        local dl_mirror="https://ghfast.top/${dl_url}"
+        if curl -fsSL --connect-timeout 15 "$dl_url" -o "$mita_tmp/mita.tar.gz" 2>/dev/null || \
+           curl -fsSL --connect-timeout 15 "$dl_mirror" -o "$mita_tmp/mita.tar.gz" 2>/dev/null; then
+            tar -zxf "$mita_tmp/mita.tar.gz" -C "$mita_tmp" 2>/dev/null || true
+            if [ -f "$mita_tmp/mita" ]; then
+                cp "$mita_tmp/mita" "${bin_dir}/mita"
+                chmod +x "${bin_dir}/mita"
+                mita_bin="${bin_dir}/mita"
+            fi
+        fi
+        rm -rf "$mita_tmp" 2>/dev/null || true
+    fi
+
+    if [ ! -x "$mita_bin" ]; then
+        warn "Не удалось загрузить бинарник mita. Установка Mieru пропущена."
+        return 1
+    fi
+
+    local m_port_mode="${MIERU_PORT_MODE:-single}"
+    local m_port="${MIERU_PORT:-8450}"
+    local m_user="${MIERU_USER:-user-default}"
+    local m_pass="${MIERU_PASS:-pass-default}"
+    local m_trans="${MIERU_TRANSPORT:-BOTH}"
+    local m_mtu="${MIERU_MTU:-1400}"
+    local m_cfg_file="${MIERU_CONFIG_FILE:-/etc/mita/config.json}"
+    local m_compat_file="${MIERU_COMPAT_CONFIG_FILE:-/etc/mita_server_config.json}"
+
+    if ! id -u mita >/dev/null 2>&1; then
+        useradd --system --no-create-home --user-group mita 2>/dev/null || true
+    fi
+    mkdir -p "$(dirname "$m_cfg_file")" /var/lib/mita /var/run/mita 2>/dev/null || true
+    chown -R mita:mita "$(dirname "$m_cfg_file")" /var/lib/mita /var/run/mita 2>/dev/null || true
+    chmod 750 "$(dirname "$m_cfg_file")" /var/lib/mita /var/run/mita 2>/dev/null || true
+
+    local py_cmd="${PYTHON_CMD:-}"
+    if [ -z "$py_cmd" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            py_cmd="python3"
+        elif command -v python >/dev/null 2>&1; then
+            py_cmd="python"
+        else
+            py_cmd="python3"
+        fi
+    fi
+
+    MIERU_CONFIG_PORT_MODE="$m_port_mode" \
+    MIERU_CONFIG_PORT_VAL="$m_port" \
+    MIERU_CONFIG_TRANSPORT="$m_trans" \
+    MIERU_CONFIG_USER="$m_user" \
+    MIERU_CONFIG_PASS="$m_pass" \
+    MIERU_CONFIG_MTU="$m_mtu" \
+    MIERU_CONFIG_FILE="$m_cfg_file" \
+    MIERU_COMPAT_CONFIG_FILE="$m_compat_file" \
+    "$py_cmd" - << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+port_mode = os.environ.get("MIERU_CONFIG_PORT_MODE", "single").lower()
+port_val = os.environ.get("MIERU_CONFIG_PORT_VAL", "8450").strip()
+transport = os.environ.get("MIERU_CONFIG_TRANSPORT", "BOTH").upper()
+user = os.environ.get("MIERU_CONFIG_USER", "user-default")
+password = os.environ.get("MIERU_CONFIG_PASS", "pass-default")
+cfg_file = os.environ.get("MIERU_CONFIG_FILE", "/etc/mita/config.json")
+compat_file = os.environ.get("MIERU_COMPAT_CONFIG_FILE", "/etc/mita_server_config.json")
+try:
+    mtu = int(os.environ.get("MIERU_CONFIG_MTU", "1400"))
+except ValueError:
+    mtu = 1400
+
+protocols = ['TCP', 'UDP'] if transport == 'BOTH' else [transport]
+port_bindings = []
+
+for proto in protocols:
+    if port_mode == 'range' or '-' in port_val:
+        port_bindings.append({'portRange': port_val, 'protocol': proto})
+    else:
+        clean_p = int(port_val.split('-')[0].split(':')[0])
+        port_bindings.append({'port': clean_p, 'protocol': proto})
+
+config = {
+    'portBindings': port_bindings,
+    'users': [{
+        'name': user,
+        'password': password
+    }],
+    'loggingLevel': 'INFO',
+    'mtu': mtu,
+    'dns': {
+        'dualStack': 'PREFER_IPv4'
+    }
+}
+
+paths = [cfg_file, compat_file]
+for path in paths:
+    target_dir = os.path.dirname(path)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=target_dir or None, prefix="mita_conf_", text=True)
+    try:
+        try:
+            os.fchmod(tmp_fd, 0o600)
+        except Exception:
+            pass
+        with open(tmp_fd, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+            f.write('\n')
+        os.replace(tmp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
+PYEOF
+    local py_rc=$?
+    if [ "$py_rc" -ne 0 ]; then
+        warn "Ошибка при создании конфигурации Mieru ($m_cfg_file)."
+        return 1
+    fi
+
+    chown mita:mita "$m_cfg_file" "$m_compat_file" 2>/dev/null || true
+    chmod 600 "$m_cfg_file" "$m_compat_file" 2>/dev/null || true
+
+    local mita_pre="mkdir -p /var/run/mita /var/lib/mita && chown -R mita:mita /var/run/mita /var/lib/mita /etc/mita && chmod 750 /var/run/mita /var/lib/mita /etc/mita && chmod 600 ${m_cfg_file} ${m_compat_file} 2>/dev/null || true"
+
+    if is_openrc; then
+        mkdir -p /etc/init.d /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        cat << EOF > /etc/init.d/mita
+#!/sbin/openrc-run
+description="Mieru proxy server (mita)"
+supervisor="supervise-daemon"
+command="${mita_bin}"
+command_args="run"
+command_user="mita:mita"
+pidfile="/run/\${RC_SVCNAME}.pid"
+respawn_delay=5
+respawn_max=5
+export MITA_LOG_NO_TIMESTAMP=true
+export MITA_CONFIG_JSON_FILE="${m_cfg_file}"
+
+start_pre() {
+    ${mita_pre}
+}
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/mita
+    else
+        mkdir -p /etc/systemd/system
+        cat << EOF > /etc/systemd/system/mita.service
+[Unit]
+Description=Mieru proxy server (mita)
+After=network-online.target network.service systemd-timesyncd.service
+Wants=network-online.target systemd-timesyncd.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=exec
+User=mita
+Group=mita
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment="MITA_LOG_NO_TIMESTAMP=true"
+Environment="MITA_CONFIG_JSON_FILE=${m_cfg_file}"
+ExecStartPre=+/bin/sh -c '${mita_pre}'
+ExecStart=${mita_bin} run
+Nice=-10
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        local ufw_m_port="${m_port//-/:}"
+        if [ "$m_trans" = "BOTH" ] || [ "$m_trans" = "TCP" ]; then
+            ufw allow "${ufw_m_port}/tcp" comment 'VPN: Mieru TCP' >/dev/null 2>&1 || true
+        fi
+        if [ "$m_trans" = "BOTH" ] || [ "$m_trans" = "UDP" ]; then
+            ufw allow "${ufw_m_port}/udp" comment 'VPN: Mieru UDP' >/dev/null 2>&1 || true
+        fi
+    fi
+
+    svc_enable mita
+    svc_restart mita 2>/dev/null || true
+    sleep 1
+    if [ -x "$mita_bin" ] && [ -f /etc/mita/config.json ]; then
+        "$mita_bin" apply config /etc/mita/config.json 2>/dev/null || true
+        "$mita_bin" start 2>/dev/null || true
+    fi
+    sleep 1
+    if svc_is_active mita; then
+        ok "Служба Mieru (mita) успешно запущена (порт ${m_port}, XChaCha20-Poly1305)."
+    else
+        svc_restart mita 2>/dev/null || true
+        sleep 1
+        if svc_is_active mita; then
+            ok "Служба Mieru (mita) успешно запущена (порт ${m_port}, XChaCha20-Poly1305)."
+        else
+            warn "Служба Mieru не перешла в статус active. Проверьте: journalctl -u mita -n 20"
+            if command -v journalctl >/dev/null 2>&1; then
+                journalctl -u mita -n 15 --no-pager 2>/dev/null || true
+            elif command -v rc-service >/dev/null 2>&1; then
+                rc-service mita status 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Развертывание CLI-менеджера пользователей Mieru
+    local src_mgr="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../system" 2>/dev/null && pwd)/mieru-mgr.sh"
+    if [ -f "$src_mgr" ]; then
+        cp -f "$src_mgr" "${bin_dir}/mieru-mgr"
+    fi
+    if [ ! -f "${bin_dir}/mieru-mgr" ]; then
+        cat << 'EOF_MIERU_MGR' > "${bin_dir}/mieru-mgr"
+# @include "system/mieru-mgr.sh"
+EOF_MIERU_MGR
+    fi
+    chmod 755 "${bin_dir}/mieru-mgr" 2>/dev/null || true
+    ln -sf "${bin_dir}/mieru-mgr" "${bin_dir}/mieru-cli" 2>/dev/null || true
+    ok "Утилита управления пользователями Mieru готова: ${bin_dir}/mieru-mgr (или mieru-cli)"
+}
+
+deploy_native_nextgen_services() {
+    if is_true "${ENABLE_ZAPRET:-0}"; then
+        setup_zapret_service
+    fi
+    if is_true "${ENABLE_MASQUE:-0}"; then
+        setup_masque_service
+    fi
+    if is_true "${ENABLE_SHADOWTLS:-0}"; then
+        setup_shadowtls_service
+    fi
+    if is_true "${ENABLE_WSTUNNEL:-0}"; then
+        setup_wstunnel_service
+    fi
+    if is_true "${ENABLE_NAIVE:-0}"; then
+        setup_naive_service
+    fi
+    if is_true "${ENABLE_DNSTT:-0}"; then
+        setup_dnstt_service
+    fi
+    if is_true "${ENABLE_MIERU:-0}"; then
+        setup_mieru_service
+    fi
+}
